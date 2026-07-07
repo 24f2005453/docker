@@ -1,123 +1,76 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import Optional
-import re
-from datetime import datetime
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+import time
+import uuid
+import logging
+from collections import deque
+
+EMAIL = "24f2005453@ds.study.iitm.ac.in"
 
 app = FastAPI()
 
+START = time.time()
 
-class ExtractRequest(BaseModel):
-    text: str
+# Prometheus counter
+REQUEST_COUNTER = Counter(
+    "http_requests_total",
+    "Total HTTP requests"
+)
 
+# In-memory log buffer
+LOGS = deque(maxlen=1000)
 
-class ExtractResponse(BaseModel):
-    vendor: str
-    amount: float
-    currency: str
-    date: str
-
-
-MONTHS = {
-    "january": 1, "february": 2, "march": 3,
-    "april": 4, "may": 5, "june": 6,
-    "july": 7, "august": 8, "september": 9,
-    "october": 10, "november": 11, "december": 12,
-}
+logger = logging.getLogger("app")
+logger.setLevel(logging.INFO)
 
 
-def parse_date(text: str):
-    # ISO format
-    m = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
-    if m:
-        return m.group(1)
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    REQUEST_COUNTER.inc()
 
-    # 2026/07/21
-    m = re.search(r"\b(20\d{2})[/-](\d{2})[/-](\d{2})\b", text)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    request_id = str(uuid.uuid4())
 
-    # July 21, 2026
-    m = re.search(
-        r"([A-Za-z]+)\s+(\d{1,2}),?\s+(20\d{2})",
-        text,
-        re.I,
-    )
-    if m:
-        month = MONTHS[m.group(1).lower()]
-        day = int(m.group(2))
-        year = int(m.group(3))
-        return f"{year:04d}-{month:02d}-{day:02d}"
+    entry = {
+        "level": "INFO",
+        "ts": time.time(),
+        "path": request.url.path,
+        "request_id": request_id,
+    }
 
-    return ""
+    LOGS.append(entry)
+
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
-@app.post("/extract", response_model=ExtractResponse)
-def extract(req: ExtractRequest):
+@app.get("/work")
+def work(n: int = 1):
+    for _ in range(n):
+        pass
+    return {
+        "email": EMAIL,
+        "done": n
+    }
 
-    text = req.text
 
-    if not text.strip():
-        return ExtractResponse(
-            vendor="",
-            amount=0,
-            currency="",
-            date=""
-        )
+@app.get("/healthz")
+def health():
+    return {
+        "status": "ok",
+        "uptime_s": time.time() - START
+    }
 
-    # Currency
-    currency = ""
-    m = re.search(r"\b(USD|EUR|GBP)\b", text, re.I)
-    if m:
-        currency = m.group(1).upper()
 
-    # Amount
-    amount = 0.0
+@app.get("/logs/tail")
+def logs_tail(limit: int = 10):
+    return list(LOGS)[-limit:]
 
-    patterns = [
-        r"Total\s+Due[:\s]*[$€£]?\s*([\d,]+(?:\.\d+)?)",
-        r"Amount\s+Due[:\s]*[$€£]?\s*([\d,]+(?:\.\d+)?)",
-        r"Balance\s+Due[:\s]*[$€£]?\s*([\d,]+(?:\.\d+)?)",
-        r"Total[:\s]*[$€£]?\s*([\d,]+(?:\.\d+)?)",
-    ]
 
-    for p in patterns:
-        m = re.search(p, text, re.I)
-        if m:
-            amount = float(m.group(1).replace(",", ""))
-            break
-
-    if amount == 0:
-        nums = re.findall(r"\d+(?:,\d{3})*(?:\.\d+)?", text)
-        if nums:
-            amount = float(nums[-1].replace(",", ""))
-
-    # Vendor
-    vendor = ""
-
-    vendor_patterns = [
-        r"Vendor[:\s]*(.+)",
-        r"From[:\s]*(.+)",
-        r"Bill From[:\s]*(.+)",
-        r"Issuer[:\s]*(.+)",
-    ]
-
-    for p in vendor_patterns:
-        m = re.search(p, text, re.I)
-        if m:
-            vendor = m.group(1).split("\n")[0].strip()
-            break
-
-    if not vendor:
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        if lines:
-            vendor = lines[0]
-
-    date = parse_date(text)
-
-    return ExtractResponse(
-        vendor=vendor,
-        amount=amount,
-        currency=currency,
-        date=date,
+@app.get("/metrics")
+def metrics():
+    return PlainTextResponse(
+        generate_latest(),
+        media_type=CONTENT_TYPE_LATEST
     )
